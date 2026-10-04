@@ -1,11 +1,11 @@
-opencv-python
+opencv-python-headless
 ultralytics
+numpy
 python-dotenv
-pyttsx3
 pydantic
 langgraph
 langchain-core
 langchain-google-genai
 fastapi
-uvicorn
+uvicorn[standard]
 websockets

@@ -1,7 +1,6 @@
 import base64
 import os
 from dotenv import load_dotenv
-import pyttsx3
 from typing import Annotated, TypedDict
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
@@ -28,9 +27,7 @@ llm = ChatGoogleGenerativeAI(
 structured_llm = llm.with_structured_output(HazardAlert)
 
 
-# Initialize the offline text-to-speech engine
-engine = pyttsx3.init()
-engine.setProperty('rate', 180) # Slightly faster for urgent alerts
+
 
 # 1. Define the State Schema
 class AgentState(TypedDict):
@@ -86,10 +83,8 @@ def gemma_reasoning_node(state: AgentState):
         print(f"⚠️ Gemini API Key notice: {err}")
         print("🔊 Using offline local audio alert fallback.")
     
-    # Generate the offline audio alert instantly
+    # Log the alert (TTS is handled by the browser frontend)
     print(f"🔊 AUDIO ALERT: {alert_text}")
-    engine.say(alert_text)
-    engine.runAndWait()
     
     # Return the response wrapped as AIMessage to append to conversational memory
     return {"messages": [AIMessage(content=alert_text)]}
