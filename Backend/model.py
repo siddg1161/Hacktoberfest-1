@@ -6,7 +6,7 @@ from typing import Annotated, TypedDict
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 
@@ -81,12 +81,12 @@ def gemma_reasoning_node(state: AgentState):
     
     # Generate the offline audio alert instantly
     alert_text = response.audio_command
-    print(f"🔊 AUDIO ALERT: {alert_text}")
+    print(f"[AUDIO ALERT]: {alert_text}")
     engine.say(alert_text)
     engine.runAndWait()
     
-    # Return the LLM response to append it to the agent's conversational memory
-    return {"messages": [response]}
+    # Return the LLM response wrapped as AIMessage to append to conversational memory
+    return {"messages": [AIMessage(content=alert_text)]}
 
 # 3. Define Conditional Routing
 def route_hazard(state: AgentState):
