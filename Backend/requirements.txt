@@ -6,3 +6,6 @@ pydantic
 langgraph
 langchain-core
 langchain-google-genai
+fastapi
+uvicorn
+websockets

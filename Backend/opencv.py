@@ -30,13 +30,19 @@ def get_yolo_data(frame):
         box_center_x = (x1 + x2) / 2
         in_path = corridor_left < box_center_x < corridor_right
         
-        # CHANGED: Now triggers for ANY object in the walking path, 
-        # ignoring the distance/size threshold to catch "every obstacle"
+        if box_center_x < width * 0.35:
+            position_label = "on your left"
+        elif box_center_x > width * 0.65:
+            position_label = "on your right"
+        else:
+            position_label = "in center path"
+
         if in_path: 
             hazard_detected = True
             
         detected_objects.append({
             "label": class_name,
+            "position": position_label,
             "relative_size": round(relative_size, 3),
             "in_path": in_path,
             "coordinates": [int(x1), int(y1), int(x2), int(y2)]

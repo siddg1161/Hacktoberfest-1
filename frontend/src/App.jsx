@@ -5,30 +5,27 @@ export default function App() {
   const [isActive, setIsActive] = useState(true);
   const [isHighContrast, setIsHighContrast] = useState(false);
   const [batteryLevel, setBatteryLevel] = useState(88);
-  const [connectionStatus, setConnectionStatus] = useState('Connected to Edge AI Camera');
+  const [wsConnected, setWsConnected] = useState(false);
   
-  // Real-time Hazard & Navigation Direction State
+  // Real-time Dynamic Navigation & Hazard State (From Python Server)
   const [hazardStatus, setHazardStatus] = useState({
-    isHazard: true,
-    alertText: 'Stop! Chair 0.5m ahead in path.',
-    directionalInstruction: 'Move 2 steps to your right.',
-    severity: 4
+    isHazard: false,
+    alertText: 'Connecting to Real-time Edge AI...',
+    severity: 1
   });
   
-  // Real-time Detected Obstacles Stream
-  const [detectedObjects, setDetectedObjects] = useState([
-    { id: 1, label: 'Chair', distance: '0.5m', position: 'CENTER PATH', relativeSize: '18%', inPath: true, direction: 'Move Right' },
-    { id: 2, label: 'Table', distance: '1.8m', position: 'RIGHT SIDE', relativeSize: '8%', inPath: false, direction: 'Clear' },
-    { id: 3, label: 'Person', distance: '2.5m', position: 'LEFT SIDE', relativeSize: '5%', inPath: false, direction: 'Clear' },
-  ]);
-
+  // Real-time Dynamic YOLO Detected Objects Stream (From Backend)
+  const [detectedObjects, setDetectedObjects] = useState([]);
   const [lastAnnouncement, setLastAnnouncement] = useState('');
-  const [gestureFeedback, setGestureFeedback] = useState('🔊 CONTINUOUS AUDIO LOOP ACTIVE • TAP FOR BATTERY • DOUBLE TAP FOR GEMMA PHOTO • LONG PRESS FOR SOS');
+  const spokenCooldownRef = useRef({});  // label -> timestamp, to avoid repeating too fast
+  const [gestureFeedback, setGestureFeedback] = useState('⚡ WEBSOCKET REAL-TIME STREAM ACTIVE • SINGLE TAP = BATTERY • DOUBLE TAP = GEMMA SNAPSHOT • LONG PRESS = SOS');
   const [capturedSnapshot, setCapturedSnapshot] = useState(null);
-  const [loopCount, setLoopCount] = useState(0);
-  
+  const [frameCount, setFrameCount] = useState(0);
+
   const videoRef = useRef(null);
   const canvasRef = useRef(document.createElement('canvas'));
+  const wsRef = useRef(null);
+  const lastSpokenTextRef = useRef('');
 
   // Gesture Recognition Refs
   const lastTapTimeRef = useRef(0);
@@ -37,7 +34,7 @@ export default function App() {
   const isLongPressRef = useRef(false);
   const touchStartRef = useRef({ x: 0, y: 0 });
 
-  // Fetch Battery Level
+  // Battery Status API
   useEffect(() => {
     if ('getBattery' in navigator) {
       navigator.getBattery().then((battery) => {
@@ -49,7 +46,7 @@ export default function App() {
     }
   }, []);
 
-  // Toggle High Contrast Mode
+  // High Contrast Theme
   useEffect(() => {
     if (isHighContrast) {
       document.body.classList.add('high-contrast');
@@ -58,23 +55,42 @@ export default function App() {
     }
   }, [isHighContrast]);
 
-  // Audio Speech Synthesis Engine (Queue & Speech De-duplication)
-  const speakText = (text, force = false) => {
-    if ('speechSynthesis' in window) {
-      // Avoid interrupting if currently speaking unless forced
-      if (window.speechSynthesis.speaking && !force) return;
-
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 1.15; // Fast, clear speech for continuous guidance
-      utterance.pitch = 1.0;
-      utterance.volume = 1.0;
-      window.speechSynthesis.speak(utterance);
-      setLastAnnouncement(text);
-    }
+  // Real-Time Audio Speech Synthesis (Text-to-Speech)
+  const speakText = (text, interrupt = false) => {
+    if (!text || !("speechSynthesis" in window)) return;
+    if (interrupt) window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.1;
+    utterance.pitch = 1.0;
+    utterance.volume = 1.0;
+    window.speechSynthesis.speak(utterance);
+    setLastAnnouncement(text);
+    lastSpokenTextRef.current = text;
   };
 
-  // Play Auditory Synthesized Tones
+  // Speak each detected object individually with its spatial direction.
+  // e.g. "chair ahead", "person on your left", "bottle on your right"
+  // Per-label cooldown prevents the same object being announced more than once per 4s.
+  const announceDetectedObjects = (objects) => {
+    if (!objects || objects.length === 0) return;
+    const now = Date.now();
+    const COOLDOWN_MS = 4000; // 4 seconds per unique label
+    objects.forEach((obj) => {
+      const label = obj.label || 'unknown object';
+      // Build full spoken phrase from label + spatial position
+      const rawPosition = obj.position || (obj.in_path ? 'in center path' : 'nearby');
+      // "in center path" -> "ahead" for natural speech
+      const spokenPosition = rawPosition === 'in center path' ? 'ahead' : rawPosition;
+      const phrase = `${label} ${spokenPosition}`; // e.g. "chair ahead"
+      const lastSpoken = spokenCooldownRef.current[label] || 0;
+      if (now - lastSpoken > COOLDOWN_MS) {
+        spokenCooldownRef.current[label] = now;
+        speakText(phrase); // speaks "chair ahead", "person on your left", etc.
+      }
+    });
+  };
+
+  // Earcon Sound Synthesizer
   const playEarcon = (type) => {
     try {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -113,48 +129,118 @@ export default function App() {
         osc.stop(ctx.currentTime + 0.15);
       }
     } catch (e) {
-      console.log('Audio Context error');
+      console.log('Audio context error');
     }
   };
 
   // =========================================================================
-  // CONTINUOUS AUDIO NAVIGATION LOOP (NO BUTTON CLICKING REQUIRED)
+  // REAL-TIME WEBSOCKET CONNECTION & DYNAMIC DETECTION STREAMING
   // =========================================================================
   useEffect(() => {
-    if (!isActive) return;
-
-    // Initial immediate audio start
-    const initialMsg = hazardStatus.isHazard 
-      ? `${hazardStatus.alertText} ${hazardStatus.directionalInstruction}`
-      : 'Path clear ahead. Continue walking straight.';
+    const wsUrl = 'ws://localhost:8000/ws/vision';
+    console.log(`Connecting to WebSocket: ${wsUrl}`);
     
-    speakText(initialMsg, true);
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
 
-    // Continuous loop interval (Runs every 3.2 seconds automatically)
-    const loopInterval = setInterval(() => {
-      setLoopCount((prev) => prev + 1);
+    ws.onopen = () => {
+      console.log('⚡ WebSocket Connected to Python Edge Server!');
+      setWsConnected(true);
+      speakText('Connected to Real-time Edge A I Vision Server.');
+    };
 
-      if (hazardStatus.isHazard) {
-        // Continuous obstacle warning + direction guidance
-        const inPathObject = detectedObjects.find((o) => o.inPath);
-        const obstacleName = inPathObject ? inPathObject.label : 'Obstacle';
-        const distance = inPathObject ? inPathObject.distance : '0.5m';
-        
-        const spokenGuidance = `Caution! ${obstacleName} ${distance} ahead. ${hazardStatus.directionalInstruction}`;
-        
-        playEarcon('hazard');
-        if (navigator.vibrate) {
-          navigator.vibrate([250, 100, 250]); // Continuous haptic warning pulse
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'navigation_update') {
+          // 1. Update Dynamic Detected Objects Stream
+          const objectsList = data.objects || [];
+          setDetectedObjects(objectsList);
+          
+          // 2. Update Dynamic Hazard Status & Text Command from Python Backend
+          const isHazard = data.hazard || false;
+          const commandText = data.command || 'Path clear ahead.';
+
+          setHazardStatus({
+            isHazard: isHazard,
+            alertText: commandText,
+            severity: isHazard ? 4 : 1
+          });
+
+          // 3. DYNAMIC TEXT-TO-SPEECH & HAPTIC VIBRATION
+          if (isActive) {
+            if (isHazard) {
+              playEarcon('hazard');
+              if (navigator.vibrate) {
+                navigator.vibrate([300, 100, 300]);
+              }
+              // Announce each hazard object individually (e.g. "chair ahead")
+              announceDetectedObjects(objectsList.filter(o => o.in_path));
+            } else {
+              // Announce all detected objects in the scene
+              announceDetectedObjects(objectsList);
+            }
+          }
         }
-        speakText(spokenGuidance, true);
-      } else {
-        // Continuous path clear confirmation
-        speakText('Path clear ahead. Continue straight.', true);
+      } catch (err) {
+        console.error('Error parsing WebSocket message:', err);
       }
-    }, 3200);
+    };
 
-    return () => clearInterval(loopInterval);
-  }, [isActive, hazardStatus, detectedObjects]);
+    ws.onerror = (err) => {
+      console.log('WebSocket Connection Error:', err);
+      setWsConnected(false);
+    };
+
+    ws.onclose = () => {
+      console.log('WebSocket Disconnected');
+      setWsConnected(false);
+    };
+
+    return () => {
+      ws.close();
+    };
+  }, [isActive]);
+
+  // =========================================================================
+  // REAL-TIME WEBCAM STREAM & FRAME TRANSMISSION (10 FPS STREAM)
+  // =========================================================================
+  useEffect(() => {
+    async function setupCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+        }
+      } catch (err) {
+        console.log('Webcam feed unavailable, ensure camera permissions are allowed.');
+      }
+    }
+    setupCamera();
+
+    // Send real-time frame to WebSocket every 200ms (~5 FPS for low latency)
+    const frameInterval = setInterval(() => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && videoRef.current) {
+        const video = videoRef.current;
+        if (video.readyState === 4) { // HAVE_ENOUGH_DATA
+          const canvas = canvasRef.current;
+          canvas.width = 320;
+          canvas.height = 240;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          
+          const base64Frame = canvas.toDataURL('image/jpeg', 0.5);
+          wsRef.current.send(JSON.stringify({
+            type: 'frame',
+            frame: base64Frame
+          }));
+          setFrameCount((prev) => prev + 1);
+        }
+      }
+    }, 200);
+
+    return () => clearInterval(frameInterval);
+  }, []);
 
   // Take Camera Snapshot
   const takeSnapshot = () => {
@@ -171,9 +257,9 @@ export default function App() {
     }
   };
 
-  // ==========================================
-  // TOUCH GESTURE SHORTCUT OVERLAYS
-  // ==========================================
+  // =========================================================================
+  // FULL TOUCH GESTURE SHORTCUT CONTROLLER
+  // =========================================================================
   const handlePointerDown = (e) => {
     if (e.target.closest('.btn-a11y')) return;
 
@@ -187,7 +273,7 @@ export default function App() {
       if (navigator.vibrate) {
         navigator.vibrate([500, 100, 500, 100, 500]);
       }
-      setGestureFeedback('🚨 SOS EMERGENCY SIGNAL TRANSMITTED!');
+      setGestureFeedback('🚨 LONG PRESS: SOS EMERGENCY SIGNAL TRANSMITTED!');
       speakText('S O S Emergency signal transmitted to your caregiver!', true);
     }, 700);
   };
@@ -211,20 +297,24 @@ export default function App() {
       if (absX > absY) {
         if (deltaX > 0) {
           setGestureFeedback('👉 SWIPE RIGHT: SCANNING RIGHT SIDE');
-          speakText('Right side clear. Table detected 1.8 meters away.', true);
+          const rightObjects = detectedObjects.filter(o => !o.inPath);
+          const rightText = rightObjects.length > 0 
+            ? `Right side: ${rightObjects.map(o => o.label).join(', ')} detected.` 
+            : 'Right side clear.';
+          speakText(rightText, true);
         } else {
           setGestureFeedback('👈 SWIPE LEFT: SCANNING LEFT SIDE');
-          speakText('Left side clear. Person 2.5 meters away.', true);
+          speakText('Left side clear.', true);
         }
       } else {
         if (deltaY > 0) {
           const nextActive = !isActive;
           setIsActive(nextActive);
-          setGestureFeedback(`👇 SWIPE DOWN: AUDIO LOOP ${nextActive ? 'RESUMED' : 'PAUSED'}`);
-          speakText(nextActive ? 'Continuous navigation audio resumed.' : 'Navigation audio paused.', true);
+          setGestureFeedback(`👇 SWIPE DOWN: AUDIO ${nextActive ? 'RESUMED' : 'PAUSED'}`);
+          speakText(nextActive ? 'Navigation audio resumed.' : 'Navigation audio paused.', true);
         } else {
-          setGestureFeedback('👆 SWIPE UP: REPEATING CURRENT DIRECTION');
-          speakText(`${hazardStatus.alertText} ${hazardStatus.directionalInstruction}`, true);
+          setGestureFeedback('👆 SWIPE UP: REPEATING CURRENT WARNING');
+          speakText(hazardStatus.alertText, true);
         }
       }
       return;
@@ -241,15 +331,15 @@ export default function App() {
       }
       takeSnapshot();
       setGestureFeedback('📷 DOUBLE TAP: GEMMA AI SCENE DESCRIPTION');
-      speakText(
-        'Analyzing surroundings with Gemma A I. I see a chair 0.5 meters ahead in your walking path and a table on the right side.',
-        true
-      );
+      const sceneSummary = detectedObjects.length > 0 
+        ? `Analyzing scene with Gemma A I. Detected ${detectedObjects.length} objects: ${detectedObjects.map(o => `${o.label}`).join(', ')}.`
+        : 'Analyzing scene with Gemma A I. Path is clear.';
+      speakText(sceneSummary, true);
     } else {
       // SINGLE TAP -> Battery & Connection Status
       tapTimeoutRef.current = setTimeout(() => {
         playEarcon('tap');
-        const statusMsg = `Battery level is at ${batteryLevel} percent. ${connectionStatus}.`;
+        const statusMsg = `Battery is at ${batteryLevel} percent. ${wsConnected ? 'Connected to Real-time Edge AI Server' : 'Disconnected from Edge AI Server'}.`;
         setGestureFeedback(`🔋 SINGLE TAP: ${statusMsg}`);
         speakText(statusMsg, true);
       }, 350);
@@ -258,54 +348,13 @@ export default function App() {
     lastTapTimeRef.current = currentTime;
   };
 
-  // Start Real Webcam Stream
-  useEffect(() => {
-    async function setupCamera() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
-      } catch (err) {
-        console.log('Webcam feed unavailable, running vision simulation mode.');
-      }
-    }
-    setupCamera();
-  }, []);
-
-  const triggerSimulatedHazard = () => {
-    setHazardStatus({
-      isHazard: true,
-      alertText: 'Caution! Stairs descending 0.8 meters ahead.',
-      directionalInstruction: 'Stop immediately. Step to your left.',
-      severity: 5
-    });
-    setDetectedObjects([
-      { id: 1, label: 'Stairs Down', distance: '0.8m', position: 'CENTER PATH', relativeSize: '24%', inPath: true, direction: 'Move Left' },
-      { id: 2, label: 'Railing', distance: '1.2m', position: 'LEFT SIDE', relativeSize: '10%', inPath: false, direction: 'Clear' },
-    ]);
-  };
-
-  const triggerSimulatedSafe = () => {
-    setHazardStatus({
-      isHazard: false,
-      alertText: 'Path Clear.',
-      directionalInstruction: 'Continue walking straight.',
-      severity: 1
-    });
-    setDetectedObjects([
-      { id: 1, label: 'Doorway', distance: '3.0m', position: 'AHEAD CLEAR', relativeSize: '4%', inPath: false, direction: 'Clear' },
-    ]);
-    speakText('Path clear ahead. Continue walking straight.', true);
-  };
-
   return (
     <div 
       className="app-container"
       onPointerDown={handlePointerDown}
       onPointerUp={handlePointerUp}
       tabIndex="0"
-      aria-label="Continuous Audio Navigation Surface for Blind Users. Audio guidance speaks continuously on loop. Tap for battery, double tap for Gemma photo, long press for SOS."
+      aria-label="Real-time Dynamic Vision Navigation System. Connects via WebSocket to Python YOLOv8 and converts real-time detections into speech automatically."
     >
       {/* SCREEN READER LIVE REGION */}
       <div 
@@ -329,7 +378,7 @@ export default function App() {
           </div>
           <div>
             <h1 className="brand-title">AURA VISION</h1>
-            <p className="status-subtitle" style={{ fontSize: '13px' }}>Continuous Real-Time Audio Navigation Loop</p>
+            <p className="status-subtitle" style={{ fontSize: '13px' }}>Real-time Dynamic WebSocket Vision Pipeline</p>
           </div>
         </div>
 
@@ -337,10 +386,10 @@ export default function App() {
           <button 
             className="btn-a11y" 
             onClick={() => setIsActive(!isActive)}
-            aria-label={isActive ? 'Pause Continuous Audio Loop' : 'Start Continuous Audio Loop'}
-            style={{ borderColor: isActive ? 'var(--safe-green)' : 'var(--warning-amber)' }}
+            aria-label={isActive ? 'Pause Speech Output' : 'Start Speech Output'}
+            style={{ borderColor: wsConnected ? 'var(--safe-green)' : 'var(--hazard-red)' }}
           >
-            <span>{isActive ? '🔊 Audio Loop: ACTIVE' : '⏸️ Audio Loop: PAUSED'}</span>
+            <span>{wsConnected ? '⚡ WEBSOCKET: CONNECTED' : '🔴 WEBSOCKET: CONNECTING...'}</span>
           </button>
           
           <button 
@@ -353,37 +402,30 @@ export default function App() {
         </div>
       </header>
 
-      {/* Continuous Loop Status & Direction Banner */}
+      {/* Dynamic Navigation & Hazard Alert Banner */}
       <div className={`status-banner ${hazardStatus.isHazard ? 'hazard' : 'safe'}`}>
         <div className="status-info">
           <div className="status-indicator-dot" aria-hidden="true" />
           <div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
               <h2 className="status-title">
-                {hazardStatus.isHazard ? 'HAZARD AHEAD' : 'PATH CLEAR'}
+                {hazardStatus.isHazard ? 'HAZARD DETECTED' : 'PATH CLEAR'}
               </h2>
               <span className="loop-pulse-badge">
-                🔊 LOOP CYCLE #{loopCount}
+                ⚡ FRAME #{frameCount}
               </span>
             </div>
             
             <p className="status-subtitle" style={{ color: '#ffffff', fontWeight: '800', fontSize: '26px', marginTop: '6px' }}>
               {hazardStatus.alertText}
             </p>
-
-            <div className="direction-box">
-              <span className="direction-icon">🧭</span>
-              <span className="direction-text">
-                DIRECTION: <strong>{hazardStatus.directionalInstruction}</strong>
-              </span>
-            </div>
           </div>
         </div>
       </div>
 
       {/* Gesture Control Feedback Bar */}
       <div className="gesture-pad-banner">
-        <div className="gesture-badge">CONTINUOUS AUDIO & GESTURE INTERACTION</div>
+        <div className="gesture-badge">DYNAMIC TOUCH & GESTURE CONTROLLER</div>
         <div className="gesture-feedback-text">{gestureFeedback}</div>
         
         <div className="gesture-guide-grid">
@@ -404,20 +446,20 @@ export default function App() {
           </div>
           <div className="gesture-card">
             <span className="gesture-icon">👈👉</span>
-            <span className="gesture-title">SWIPE LEFT / RIGHT</span>
-            <span className="gesture-desc">Scan Left / Right Side</span>
+            <span className="gesture-title">SWIPE GESTURES</span>
+            <span className="gesture-desc">Scan Surroundings</span>
           </div>
         </div>
       </div>
 
       {/* Workspace Grid */}
       <div className="workspace-grid">
-        {/* Camera Feed with Safe Corridor */}
+        {/* Real-time WebCam Stream */}
         <div className="card">
           <div className="card-title">
-            <span>LIVE REAL-TIME VISION CORRIDOR</span>
+            <span>LIVE CAMERA FEED (WEBSOCKET TRANSMITTER)</span>
             <span style={{ fontSize: '13px', color: 'var(--safe-green)', fontFamily: 'var(--font-mono)' }}>
-              ● 30 FPS YOLOv8 Tracking
+              ● Streaming to ws://localhost:8000
             </span>
           </div>
           
@@ -442,55 +484,44 @@ export default function App() {
           )}
         </div>
 
-        {/* Real-Time Objects & Directional Telemetry */}
+        {/* Dynamic Real-Time Detections List (Received from WebSocket) */}
         <div className="card">
           <div className="card-title">
-            <span>REAL-TIME OBSTACLE STREAM</span>
+            <span>REAL-TIME DYNAMIC DETECTIONS</span>
             <span style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
-              {detectedObjects.length} Objects Tracked
+              {detectedObjects.length} Objects Live
             </span>
           </div>
 
           <div className="detections-list">
-            {detectedObjects.map((obj) => (
-              <div 
-                key={obj.id} 
-                className={`detection-item ${obj.inPath ? 'in-path-hazard' : ''}`}
-              >
-                <div>
-                  <div className="detection-name">{obj.label} ({obj.distance})</div>
-                  <div style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '2px' }}>
-                    Position: <strong>{obj.position}</strong> • Size: {obj.relativeSize}
+            {detectedObjects.length > 0 ? (
+              detectedObjects.map((obj, idx) => (
+                <div 
+                  key={idx} 
+                  className={`detection-item ${obj.in_path ? 'in-path-hazard' : ''}`}
+                >
+                  <div>
+                    <div className="detection-name">{obj.label}</div>
+                    <div style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '2px' }}>
+                      Coordinates: [{obj.coordinates ? obj.coordinates.join(', ') : 'N/A'}]
+                    </div>
+                  </div>
+                  
+                  <div style={{ textAlign: 'right' }}>
+                    <span className={`detection-badge ${obj.in_path ? 'hazard' : 'safe'}`}>
+                      {obj.in_path ? 'IN PATH (HAZARD)' : 'SIDE PATH'}
+                    </span>
+                    <div style={{ fontSize: '11px', color: 'var(--cyan-glow)', marginTop: '4px', fontWeight: '700' }}>
+                      Size: {obj.relative_size}
+                    </div>
                   </div>
                 </div>
-                
-                <div style={{ textAlign: 'right' }}>
-                  <span className={`detection-badge ${obj.inPath ? 'hazard' : 'safe'}`}>
-                    {obj.inPath ? 'HAZARD' : 'SIDE'}
-                  </span>
-                  <div style={{ fontSize: '11px', color: 'var(--cyan-glow)', marginTop: '4px', fontWeight: '700' }}>
-                    {obj.direction}
-                  </div>
-                </div>
+              ))
+            ) : (
+              <div style={{ padding: '30px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                Scanning camera feed for obstacles...
               </div>
-            ))}
-          </div>
-
-          <div style={{ marginTop: '20px', display: 'flex', gap: '10px' }}>
-            <button 
-              className="btn-a11y" 
-              style={{ flex: 1, justifyContent: 'center', borderColor: 'var(--hazard-red)' }}
-              onClick={triggerSimulatedHazard}
-            >
-              Simulate Stairs Hazard
-            </button>
-            <button 
-              className="btn-a11y" 
-              style={{ flex: 1, justifyContent: 'center', borderColor: 'var(--safe-green)' }}
-              onClick={triggerSimulatedSafe}
-            >
-              Simulate Safe Path
-            </button>
+            )}
           </div>
         </div>
       </div>
