@@ -1,5 +1,5 @@
 import cv2
-from model import navigation
+from model import navigation_agent
 from ultralytics import YOLO
 
 # Load the lightweight, ultra-low-latency edge model
@@ -81,12 +81,12 @@ def run_vision_loop():
             
             print(f"HAZARD DETECTED! Awakening Agent with {len(objects)} objects.")
             
-            #result = navigation_agent.invoke({
-             #   "current_frame": frame_bytes, 
-             #   "detected_objects": objects,
-             #   "hazard_detected": True,
-             #   "messages": [] # LangGraph will handle appending to the memory automatically
-            #})
+            result = navigation_agent.invoke({
+                "current_frame": frame_bytes, 
+                "detected_objects": objects,
+                "hazard_detected": True,
+                "messages": [] # LangGraph will handle appending to the memory automatically
+            })
             
             # Temporarily pause loop to prevent spamming the LLM
             cv2.waitKey(3000) 

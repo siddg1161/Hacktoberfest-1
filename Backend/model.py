@@ -1,8 +1,9 @@
 import base64
+import os
 from dotenv import load_dotenv
 import pyttsx3
 from typing import Annotated, TypedDict
-from pydantic import BaseModel, Fieldpip
+from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_core.messages import HumanMessage
@@ -76,10 +77,10 @@ def gemma_reasoning_node(state: AgentState):
     )
     
     # Call the multimodal LLM for context analysis
-    response = llm.invoke([message])
+    response = structured_llm.invoke([message])
     
     # Generate the offline audio alert instantly
-    alert_text = response.content.strip()
+    alert_text = response.audio_command
     print(f"🔊 AUDIO ALERT: {alert_text}")
     engine.say(alert_text)
     engine.runAndWait()
