@@ -180,7 +180,7 @@ export default function App() {
   // REAL-TIME WEBSOCKET CONNECTION & DYNAMIC DETECTION STREAMING
   // =========================================================================
   useEffect(() => {
-    const wsUrl = 'ws://localhost:8000/ws/vision';
+    const wsUrl = 'wss://hacktoberfest-1-j3n5.onrender.com/ws/vision';
     console.log(`Connecting to WebSocket: ${wsUrl}`);
 
     const ws = new WebSocket(wsUrl);
