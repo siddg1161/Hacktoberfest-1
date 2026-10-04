@@ -6,18 +6,24 @@ export default function App() {
   const [isHighContrast, setIsHighContrast] = useState(false);
   const [batteryLevel, setBatteryLevel] = useState(88);
   const [wsConnected, setWsConnected] = useState(false);
-  
+
   // Real-time Dynamic Navigation & Hazard State (From Python Server)
   const [hazardStatus, setHazardStatus] = useState({
     isHazard: false,
     alertText: 'Connecting to Real-time Edge AI...',
     severity: 1
   });
-  
+
   // Real-time Dynamic YOLO Detected Objects Stream (From Backend)
   const [detectedObjects, setDetectedObjects] = useState([]);
   const [lastAnnouncement, setLastAnnouncement] = useState('');
   const spokenCooldownRef = useRef({});  // label -> timestamp, to avoid repeating too fast
+
+  // --- VOLUME CONTROLS ---
+  // Buzz (earcon) volume: kept low so it doesn't startle
+  // Speech (directions) volume: kept high so instructions are clearly heard
+  const buzzVolumeRef = useRef(0.05);    // very low buzz for hazard earcon
+  const speechVolumeRef = useRef(1.0);   // full volume for spoken directions
   const [gestureFeedback, setGestureFeedback] = useState('⚡ WEBSOCKET REAL-TIME STREAM ACTIVE • SINGLE TAP = BATTERY • DOUBLE TAP = GEMMA SNAPSHOT • LONG PRESS = SOS');
   const [capturedSnapshot, setCapturedSnapshot] = useState(null);
   const [frameCount, setFrameCount] = useState(0);
@@ -56,13 +62,14 @@ export default function App() {
   }, [isHighContrast]);
 
   // Real-Time Audio Speech Synthesis (Text-to-Speech)
+  // Uses speechVolumeRef (1.0) so directions like "chair ahead" are spoken loudly and clearly
   const speakText = (text, interrupt = false) => {
     if (!text || !("speechSynthesis" in window)) return;
     if (interrupt) window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = 1.1;
     utterance.pitch = 1.0;
-    utterance.volume = 1.0;
+    utterance.volume = speechVolumeRef.current; // HIGH volume for directions
     window.speechSynthesis.speak(utterance);
     setLastAnnouncement(text);
     lastSpokenTextRef.current = text;
@@ -89,39 +96,74 @@ export default function App() {
       }
     });
   };
+  // Configurable Hazard Audio Sound Properties
+  // buzzVolumeRef (0.12) keeps the earcon subtle — not startling
+  const [hazardSoundConfig, setHazardSoundConfig] = useState({
+    volume: 0.05,      // Very low buzz volume
+    startFreq: 400,    // Mid-low buzz frequency — clearly hearable on laptop speakers
+    duration: 0.18     // Short pulse duration
+  });
+
+  // Sync hazardSoundConfig.volume from buzzVolumeRef on mount
+  // (both are kept in sync — edit buzzVolumeRef to change buzz loudness)
 
   // Earcon Sound Synthesizer
-  const playEarcon = (type) => {
+  const playEarcon = (type, customConfig = {}) => {
     try {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const ctx = new AudioCtx();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-
-      osc.connect(gain);
-      gain.connect(ctx.destination);
+      const AudioCtxClass = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AudioCtxClass();
 
       if (type === 'shutter') {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
         osc.type = 'square';
         osc.frequency.setValueAtTime(1200, ctx.currentTime);
         gain.gain.setValueAtTime(0.3, ctx.currentTime);
         osc.start();
         osc.stop(ctx.currentTime + 0.08);
+
       } else if (type === 'sos') {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
         osc.type = 'sawtooth';
         osc.frequency.setValueAtTime(900, ctx.currentTime);
         osc.frequency.setValueAtTime(1400, ctx.currentTime + 0.15);
         gain.gain.setValueAtTime(0.4, ctx.currentTime);
         osc.start();
         osc.stop(ctx.currentTime + 0.35);
+
       } else if (type === 'hazard') {
-        osc.type = 'sawtooth';
-        osc.frequency.setValueAtTime(880, ctx.currentTime);
-        osc.frequency.setValueAtTime(440, ctx.currentTime + 0.12);
-        gain.gain.setValueAtTime(0.3, ctx.currentTime);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.25);
+        // Double-pulse buzz — clearly audible warning sound
+        const vol = customConfig.volume ?? hazardSoundConfig.volume;
+        const freq = customConfig.startFreq ?? hazardSoundConfig.startFreq;
+        const dur = customConfig.duration ?? hazardSoundConfig.duration;
+
+        const playPulse = (startAt) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.type = 'sawtooth';        // buzzy feel
+          osc.frequency.value = freq;   // 400 Hz — clearly audible
+          gain.gain.setValueAtTime(0, startAt);
+          gain.gain.linearRampToValueAtTime(vol, startAt + 0.02); // quick attack
+          gain.gain.linearRampToValueAtTime(0, startAt + dur);    // smooth fade out
+          osc.start(startAt);
+          osc.stop(startAt + dur + 0.01);
+        };
+
+        playPulse(ctx.currentTime);           // BUZZ 1
+        playPulse(ctx.currentTime + dur + 0.08); // BUZZ 2 (short gap)
+
       } else {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
         osc.type = 'sine';
         osc.frequency.setValueAtTime(523.25, ctx.currentTime);
         gain.gain.setValueAtTime(0.15, ctx.currentTime);
@@ -129,9 +171,10 @@ export default function App() {
         osc.stop(ctx.currentTime + 0.15);
       }
     } catch (e) {
-      console.log('Audio context error');
+      console.log('Audio context error:', e);
     }
   };
+
 
   // =========================================================================
   // REAL-TIME WEBSOCKET CONNECTION & DYNAMIC DETECTION STREAMING
@@ -139,7 +182,7 @@ export default function App() {
   useEffect(() => {
     const wsUrl = 'ws://localhost:8000/ws/vision';
     console.log(`Connecting to WebSocket: ${wsUrl}`);
-    
+
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
@@ -156,7 +199,7 @@ export default function App() {
           // 1. Update Dynamic Detected Objects Stream
           const objectsList = data.objects || [];
           setDetectedObjects(objectsList);
-          
+
           // 2. Update Dynamic Hazard Status & Text Command from Python Backend
           const isHazard = data.hazard || false;
           const commandText = data.command || 'Path clear ahead.';
@@ -228,7 +271,7 @@ export default function App() {
           canvas.height = 240;
           const ctx = canvas.getContext('2d');
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          
+
           const base64Frame = canvas.toDataURL('image/jpeg', 0.5);
           wsRef.current.send(JSON.stringify({
             type: 'frame',
@@ -265,7 +308,7 @@ export default function App() {
 
     touchStartRef.current = { x: e.clientX, y: e.clientY };
     isLongPressRef.current = false;
-    
+
     // LONG PRESS (Hold for 700ms) -> Caregiver SOS Signal
     longPressTimerRef.current = setTimeout(() => {
       isLongPressRef.current = true;
@@ -298,8 +341,8 @@ export default function App() {
         if (deltaX > 0) {
           setGestureFeedback('👉 SWIPE RIGHT: SCANNING RIGHT SIDE');
           const rightObjects = detectedObjects.filter(o => !o.inPath);
-          const rightText = rightObjects.length > 0 
-            ? `Right side: ${rightObjects.map(o => o.label).join(', ')} detected.` 
+          const rightText = rightObjects.length > 0
+            ? `Right side: ${rightObjects.map(o => o.label).join(', ')} detected.`
             : 'Right side clear.';
           speakText(rightText, true);
         } else {
@@ -331,7 +374,7 @@ export default function App() {
       }
       takeSnapshot();
       setGestureFeedback('📷 DOUBLE TAP: GEMMA AI SCENE DESCRIPTION');
-      const sceneSummary = detectedObjects.length > 0 
+      const sceneSummary = detectedObjects.length > 0
         ? `Analyzing scene with Gemma A I. Detected ${detectedObjects.length} objects: ${detectedObjects.map(o => `${o.label}`).join(', ')}.`
         : 'Analyzing scene with Gemma A I. Path is clear.';
       speakText(sceneSummary, true);
@@ -349,7 +392,7 @@ export default function App() {
   };
 
   return (
-    <div 
+    <div
       className="app-container"
       onPointerDown={handlePointerDown}
       onPointerUp={handlePointerUp}
@@ -357,10 +400,10 @@ export default function App() {
       aria-label="Real-time Dynamic Vision Navigation System. Connects via WebSocket to Python YOLOv8 and converts real-time detections into speech automatically."
     >
       {/* SCREEN READER LIVE REGION */}
-      <div 
-        role="status" 
-        aria-live="assertive" 
-        aria-atomic="true" 
+      <div
+        role="status"
+        aria-live="assertive"
+        aria-atomic="true"
         className="screen-reader-only"
       >
         {lastAnnouncement}
@@ -371,9 +414,9 @@ export default function App() {
         <div className="brand">
           <div className="brand-icon" aria-hidden="true">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-              <line x1="12" y1="19" x2="12" y2="22"/>
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <line x1="12" y1="19" x2="12" y2="22" />
             </svg>
           </div>
           <div>
@@ -383,17 +426,17 @@ export default function App() {
         </div>
 
         <div className="a11y-toggles">
-          <button 
-            className="btn-a11y" 
+          <button
+            className="btn-a11y"
             onClick={() => setIsActive(!isActive)}
             aria-label={isActive ? 'Pause Speech Output' : 'Start Speech Output'}
             style={{ borderColor: wsConnected ? 'var(--safe-green)' : 'var(--hazard-red)' }}
           >
             <span>{wsConnected ? '⚡ WEBSOCKET: CONNECTED' : '🔴 WEBSOCKET: CONNECTING...'}</span>
           </button>
-          
-          <button 
-            className="btn-a11y" 
+
+          <button
+            className="btn-a11y"
             onClick={() => setIsHighContrast(!isHighContrast)}
             aria-label={`Toggle High Contrast Mode. Current mode: ${isHighContrast ? 'On' : 'Off'}`}
           >
@@ -415,7 +458,7 @@ export default function App() {
                 ⚡ FRAME #{frameCount}
               </span>
             </div>
-            
+
             <p className="status-subtitle" style={{ color: '#ffffff', fontWeight: '800', fontSize: '26px', marginTop: '6px' }}>
               {hazardStatus.alertText}
             </p>
@@ -427,7 +470,7 @@ export default function App() {
       <div className="gesture-pad-banner">
         <div className="gesture-badge">DYNAMIC TOUCH & GESTURE CONTROLLER</div>
         <div className="gesture-feedback-text">{gestureFeedback}</div>
-        
+
         <div className="gesture-guide-grid">
           <div className="gesture-card">
             <span className="gesture-icon">🔋</span>
@@ -462,7 +505,7 @@ export default function App() {
               ● Streaming to ws://localhost:8000
             </span>
           </div>
-          
+
           <div className="camera-view">
             <video ref={videoRef} autoPlay playsInline muted className="camera-feed" />
             <div className="safe-corridor-overlay">
@@ -475,10 +518,10 @@ export default function App() {
               <span style={{ fontSize: '12px', color: 'var(--warning-amber)', fontWeight: '700' }}>
                 📷 GEMMA AI ANALYZED SNAPSHOT:
               </span>
-              <img 
-                src={capturedSnapshot} 
-                alt="Captured scene analyzed by Gemma AI" 
-                style={{ width: '100%', height: '100px', objectFit: 'cover', borderRadius: '8px', marginTop: '6px', border: '1px solid var(--warning-amber)' }} 
+              <img
+                src={capturedSnapshot}
+                alt="Captured scene analyzed by Gemma AI"
+                style={{ width: '100%', height: '100px', objectFit: 'cover', borderRadius: '8px', marginTop: '6px', border: '1px solid var(--warning-amber)' }}
               />
             </div>
           )}
@@ -496,8 +539,8 @@ export default function App() {
           <div className="detections-list">
             {detectedObjects.length > 0 ? (
               detectedObjects.map((obj, idx) => (
-                <div 
-                  key={idx} 
+                <div
+                  key={idx}
                   className={`detection-item ${obj.in_path ? 'in-path-hazard' : ''}`}
                 >
                   <div>
@@ -506,7 +549,7 @@ export default function App() {
                       Coordinates: [{obj.coordinates ? obj.coordinates.join(', ') : 'N/A'}]
                     </div>
                   </div>
-                  
+
                   <div style={{ textAlign: 'right' }}>
                     <span className={`detection-badge ${obj.in_path ? 'hazard' : 'safe'}`}>
                       {obj.in_path ? 'IN PATH (HAZARD)' : 'SIDE PATH'}

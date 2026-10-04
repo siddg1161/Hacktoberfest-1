@@ -21,7 +21,7 @@ class HazardAlert(BaseModel):
 # Initialize the generative API via LangChain
 llm = ChatGoogleGenerativeAI(
     google_api_key=api_key or "YOUR_API_KEY_HERE",
-    model="gemini-2.5-flash", 
+    model="gemma-4-26b-a4b-it", 
     temperature=0.2, 
     max_retries=2
 )
