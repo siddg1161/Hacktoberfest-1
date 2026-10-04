@@ -7,7 +7,13 @@ import uvicorn
 import cv2
 import numpy as np
 
-from model import navigation_agent
+try:
+    from model import navigation_agent
+    AGENT_AVAILABLE = True
+except Exception as e:
+    print(f"⚠️ Agent not available: {e}")
+    navigation_agent = None
+    AGENT_AVAILABLE = False
 from opencv import get_yolo_data
 
 app = FastAPI(title="AURA Vision Assistive Navigation Server")
