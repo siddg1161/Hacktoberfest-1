@@ -79,8 +79,8 @@ def gemma_reasoning_node(state: AgentState):
     
     # Call the multimodal LLM for context analysis
     try:
-        response = llm.invoke([message])
-        alert_text = str(response.content).strip()
+        response = structured_llm.invoke([message])
+        alert_text = response.audio_command
     except Exception as err:
         alert_text = "Hazard detected in path"
         print(f"⚠️ Gemini API Key notice: {err}")
