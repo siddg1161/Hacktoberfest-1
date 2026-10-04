@@ -1,8 +1,9 @@
 import base64
+import os
 from dotenv import load_dotenv
 import pyttsx3
 from typing import Annotated, TypedDict
-from pydantic import BaseModel, Fieldpip
+from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_core.messages import HumanMessage
@@ -10,7 +11,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 
 load_dotenv()
-api_key=os.getenv("GOOGLE_API_KEY")
+api_key = os.getenv("GOOGLE_API_KEY")
 
 class HazardAlert(BaseModel):
     severity: int = Field(description="Severity of the hazard from 1 (low) to 5 (critical)")
@@ -19,7 +20,8 @@ class HazardAlert(BaseModel):
 
 # Initialize the generative API via LangChain
 llm = ChatGoogleGenerativeAI(
-    model="gemma-4-26b-a4b-it", 
+    google_api_key=api_key or "YOUR_API_KEY_HERE",
+    model="gemini-2.5-flash", 
     temperature=0.2, 
     max_retries=2
 )
@@ -76,16 +78,21 @@ def gemma_reasoning_node(state: AgentState):
     )
     
     # Call the multimodal LLM for context analysis
-    response = llm.invoke([message])
+    try:
+        response = llm.invoke([message])
+        alert_text = str(response.content).strip()
+    except Exception as err:
+        alert_text = "Hazard detected in path"
+        print(f"⚠️ Gemini API Key notice: {err}")
+        print("🔊 Using offline local audio alert fallback.")
     
     # Generate the offline audio alert instantly
-    alert_text = response.content.strip()
     print(f"🔊 AUDIO ALERT: {alert_text}")
     engine.say(alert_text)
     engine.runAndWait()
     
-    # Return the LLM response to append it to the agent's conversational memory
-    return {"messages": [response]}
+    # Return the response to append it to the agent's conversational memory
+    return {"messages": [HumanMessage(content=alert_text)]}
 
 # 3. Define Conditional Routing
 def route_hazard(state: AgentState):

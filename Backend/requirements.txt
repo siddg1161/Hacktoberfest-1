@@ -1,0 +1,8 @@
+opencv-python
+ultralytics
+python-dotenv
+pyttsx3
+pydantic
+langgraph
+langchain-core
+langchain-google-genai
